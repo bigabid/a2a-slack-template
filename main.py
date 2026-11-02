@@ -8,8 +8,8 @@ from handlers import register_handlers
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-app = AsyncApp(token=os.environ.get("SLACK_BOT_TOKEN")) 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+app = AsyncApp(token=os.environ["SLACK_BOT_TOKEN"])
 
 async def error_handler(error, body):
     logging.error(f"Error: {error} - {body}")
@@ -21,7 +21,7 @@ register_handlers(app)
 
 async def main():
     logging.info("Starting kagent Slack bot")
-    app_handler = AsyncSocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
+    app_handler = AsyncSocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     await app_handler.start_async()
 
 if __name__ == "__main__":
