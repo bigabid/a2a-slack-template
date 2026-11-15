@@ -5,6 +5,8 @@ import re
 import uuid
 import httpx
 import os
+import json
+from urllib.parse import urlsplit
 from a2a.client import A2AClient
 from a2a.types import Message, TextPart, MessageSendParams, SendMessageRequest
 
@@ -13,6 +15,13 @@ CHANNELS = {c.strip() for c in os.environ.get("SLACK_CHANNELS", "").split(",") i
 TIMEOUT = float(os.environ.get("A2A_TIMEOUT_SECONDS", "600"))
 MARKDOWN_BLOCK_LIMIT = 12000
 FALLBACK_TEXT_LIMIT = 3000
+# Tools whose result is posted to Slack word for word, so the model never has to copy it (for example
+# code-computed reports). The agent writes the line "[[REPORT:<tool>]]" where the report goes; if the line
+# is missing, the report is posted after the answer.
+TOOL_REPORTS = [t.strip() for t in os.environ.get("TOOL_REPORTS", "").split(",") if t.strip()]
+REPORT_MARK = re.compile(r"^[ \t]*\[\[REPORT:([A-Za-z0-9_\-]+)\]\][ \t]*$", re.M)
+# A closing line some tools add for the model ("END OF REPORT ..."); not shown in Slack.
+END_MARK = re.compile(r"\n*^END OF REPORT.*$", re.M)
 
 
 def split_answer(answer: str, limit: int = MARKDOWN_BLOCK_LIMIT) -> list[str]:
@@ -73,7 +82,63 @@ async def invoke_a2a_agent(agent_url: str, input: str, context_id: str, user: st
         raise RuntimeError(detail or f"agent ended in state {state}")
 
     # Some models return their working first; the last text part is the answer.
-    return texts[-1].strip(), extract_usage_info(result)
+    answer = texts[-1].strip()
+    if TOOL_REPORTS:
+        answer = await insert_tool_reports(
+            agent_url, getattr(result, "context_id", None) or context_id, user, answer, logger)
+    return answer, extract_usage_info(result)
+
+
+async def fetch_tool_reports(agent_url: str, session_id: str, user: str) -> dict[str, str]:
+    """
+    Reads the session from the kagent controller and returns the latest result of each TOOL_REPORTS tool
+    from the last turn (events after the last user message).
+    """
+    base = "{0.scheme}://{0.netloc}".format(urlsplit(agent_url))
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.get(f"{base}/api/sessions/{session_id}", params={"user_id": user})
+        r.raise_for_status()
+    body = r.json()
+    events = (body.get("data") or body).get("events") or []
+    events = sorted(events, key=lambda e: e.get("created_at", ""))
+    parsed = [json.loads(e["data"]) if isinstance(e.get("data"), str) else (e.get("data") or {}) for e in events]
+    last_user = max((i for i, x in enumerate(parsed) if x.get("Author") == "user"), default=-1)
+    reports = {}
+    for x in parsed[last_user + 1:]:
+        for part in ((x.get("Content") or {}).get("parts") or []):
+            fr = part.get("functionResponse") or {}
+            if fr.get("name") in TOOL_REPORTS:
+                out = (fr.get("response") or {}).get("output")
+                if isinstance(out, dict):
+                    out = out.get("result") or json.dumps(out)
+                if isinstance(out, str) and out.strip():
+                    reports[fr["name"]] = END_MARK.sub("", out).strip()
+    return reports
+
+
+async def insert_tool_reports(agent_url: str, session_id: str, user: str, answer: str, logger: Logger) -> str:
+    """Replaces each [[REPORT:<tool>]] line with that tool's result, word for word; appends unplaced reports."""
+    try:
+        reports = await fetch_tool_reports(agent_url, session_id, user)
+    except Exception as e:
+        logger.exception(f"could not read tool reports for session {session_id}")
+        reports, error = {}, str(e)[:200]
+    else:
+        error = None
+    placed = set()
+
+    def fill(m):
+        name = m.group(1)
+        if name in reports:
+            placed.add(name)
+            return reports[name]
+        return f"_(The {name} report could not be attached{': ' + error if error else ''}.)_"
+
+    answer = REPORT_MARK.sub(fill, answer)
+    for name, text in reports.items():
+        if name not in placed:
+            answer += "\n\n" + text
+    return answer
 
 
 def extract_usage_info(task) -> str:
