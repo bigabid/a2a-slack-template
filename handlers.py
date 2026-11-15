@@ -15,6 +15,30 @@ MARKDOWN_BLOCK_LIMIT = 12000
 FALLBACK_TEXT_LIMIT = 3000
 
 
+def split_answer(answer: str, limit: int = MARKDOWN_BLOCK_LIMIT) -> list[str]:
+    """
+    Splits a long answer into parts of at most `limit` characters (one Slack message each), at the last
+    section heading (a line starting with "**" or "#"), else the last blank line, else the last line break
+    before the limit, so tables and lists are not cut in the middle. Nothing is dropped.
+    """
+    parts = []
+    rest = answer.strip()
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = max(window.rfind("\n**"), window.rfind("\n#"))
+        if cut < limit // 3:
+            cut = window.rfind("\n\n")
+        if cut < limit // 3:
+            cut = window.rfind("\n")
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        parts.append(rest)
+    return parts or [""]
+
+
 async def invoke_a2a_agent(agent_url: str, input: str, context_id: str, user: str, logger: Logger):
     """
     Invokes the A2A agent in the conversation `context_id` and returns the answer and usage information.
@@ -90,13 +114,15 @@ async def on_mention(event, client: AsyncWebClient, logger: Logger):
         logger.exception(f"agent call failed for {channel}/{thread_ts}")
         answer = f":warning: {AGENT_NAME} couldn't answer: {str(e)[:500]}"
 
-    blocks = [{"type": "markdown", "text": answer[:MARKDOWN_BLOCK_LIMIT]}]
-    if usage_info:
-        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": usage_info}]})
-    await client.chat_postMessage(
-        channel=channel, thread_ts=thread_ts, blocks=blocks,
-        text=answer[:FALLBACK_TEXT_LIMIT], unfurl_links=False,
-    )
+    parts = split_answer(answer)
+    for i, part in enumerate(parts):
+        blocks = [{"type": "markdown", "text": part}]
+        if usage_info and i == len(parts) - 1:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": usage_info}]})
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, blocks=blocks,
+            text=part[:FALLBACK_TEXT_LIMIT], unfurl_links=False,
+        )
     try:
         await client.reactions_remove(channel=channel, timestamp=event["ts"], name="eyes")
     except Exception:
